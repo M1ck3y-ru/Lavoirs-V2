@@ -8,7 +8,12 @@ const MANUAL_MODE_LABEL_IDLE = 'Définir une position manuellement';
 const MANUAL_MODE_LABEL_ARMED = 'Cliquez sur la carte pour définir votre position…';
 
 const COMMONS_API = 'https://commons.wikimedia.org/w/api.php';
-const PHOTO_GEOSEARCH_RADIUS_M = 300; // rayon serré pour rester pertinent au lavoir, pas au quartier
+const WIKIDATA_API = 'https://www.wikidata.org/w/api.php';
+// Rayon élargi car le repli geosearch est maintenant filtré par pertinence
+// (mot-clé dans le titre) plutôt que de prendre la photo la plus proche sans distinction.
+const PHOTO_GEOSEARCH_RADIUS_M = 1000;
+const PHOTO_GEOSEARCH_CANDIDATES = 10; // pool élargi avant filtrage par pertinence
+const PHOTO_RELEVANCE_KEYWORDS = /lavoir|laundry|wash.?house/i;
 const MAX_PHOTOS = 3;
 let photosRequestId = 0; // ignore les réponses tardives d'une sélection déjà remplacée
 const photosCache = new Map(); // lavoir.id -> photos[], évite de re-interroger Commons en resélectionnant
@@ -157,6 +162,7 @@ out center;`;
         commune: el.tags?.['addr:city'] || el.tags?.['addr:place'] || '',
         wikimediaCommons: el.tags?.wikimedia_commons || null,
         image: el.tags?.image || null,
+        wikidata: el.tags?.wikidata || null,
         lat,
         lng,
       };
@@ -331,13 +337,13 @@ function clearRoute() {
   hideRouteSummary();
 }
 
-// Extrait jusqu'à MAX_PHOTOS entrées {thumbUrl, fullUrl, title} d'une réponse
+// Extrait jusqu'à `limit` entrées {thumbUrl, fullUrl, title} d'une réponse
 // Commons API de la forme query.pages (clé = pageid).
-function commonsPagesToPhotos(pages) {
+function commonsPagesToPhotos(pages, limit = MAX_PHOTOS) {
   if (!pages) return [];
   return Object.values(pages)
     .filter((p) => p.imageinfo?.length)
-    .slice(0, MAX_PHOTOS)
+    .slice(0, limit)
     .map((p) => ({
       thumbUrl: p.imageinfo[0].thumburl || p.imageinfo[0].url,
       fullUrl: p.imageinfo[0].url,
@@ -345,9 +351,9 @@ function commonsPagesToPhotos(pages) {
     }));
 }
 
-// Requête Commons partagée par les 3 sources ci-dessous : chacune ne diffère
+// Requête Commons partagée par les sources ci-dessous : chacune ne diffère
 // que par ses paramètres (generator/titles), le fetch+parse est commun.
-async function fetchCommonsJson(params) {
+async function fetchCommonsJson(params, limit = MAX_PHOTOS) {
   const query = new URLSearchParams({
     action: 'query',
     prop: 'imageinfo',
@@ -360,12 +366,30 @@ async function fetchCommonsJson(params) {
   const res = await fetch(`${COMMONS_API}?${query}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return commonsPagesToPhotos(data.query?.pages);
+  return commonsPagesToPhotos(data.query?.pages, limit);
 }
 
-// Source prioritaire : tags OSM directs (wikimedia_commons puis image).
-// Repli : recherche géographique Wikimedia Commons autour du lavoir,
-// rayon serré (PHOTO_GEOSEARCH_RADIUS_M) pour rester pertinent.
+// Photo Wikidata (propriété P18) du lavoir, si son tag OSM `wikidata` pointe
+// vers une entité qui en a une — source spécifique au lieu, plus fiable
+// qu'une recherche par simple proximité géographique.
+async function fetchWikidataImageTitle(wikidataId) {
+  const query = new URLSearchParams({
+    action: 'wbgetclaims',
+    entity: wikidataId,
+    property: 'P18',
+    format: 'json',
+    origin: '*',
+  });
+  const res = await fetch(`${WIKIDATA_API}?${query}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const filename = data.claims?.P18?.[0]?.mainsnak?.datavalue?.value;
+  return filename ? `File:${filename}` : null;
+}
+
+// Ordre de priorité : tags OSM directs (wikimedia_commons, image) > photo
+// Wikidata liée au lieu (tag wikidata) > repli geosearch Wikimedia Commons,
+// filtré par mot-clé pertinent (évite les photos hors-sujet juste proches).
 async function fetchLavoirPhotos(lavoir) {
   if (lavoir.wikimediaCommons) {
     const title = lavoir.wikimediaCommons.trim();
@@ -378,13 +402,18 @@ async function fetchLavoirPhotos(lavoir) {
   if (lavoir.image && /^https?:\/\//i.test(lavoir.image)) {
     return [{ thumbUrl: lavoir.image, fullUrl: lavoir.image, title: lavoir.name }];
   }
-  return fetchCommonsJson({
+  if (lavoir.wikidata) {
+    const fileTitle = await fetchWikidataImageTitle(lavoir.wikidata).catch(() => null);
+    if (fileTitle) return fetchCommonsJson({ titles: fileTitle });
+  }
+  const candidates = await fetchCommonsJson({
     generator: 'geosearch',
     ggscoord: `${lavoir.lat}|${lavoir.lng}`,
     ggsradius: PHOTO_GEOSEARCH_RADIUS_M,
-    ggslimit: MAX_PHOTOS,
+    ggslimit: PHOTO_GEOSEARCH_CANDIDATES,
     ggsnamespace: 6,
-  });
+  }, PHOTO_GEOSEARCH_CANDIDATES);
+  return candidates.filter((p) => PHOTO_RELEVANCE_KEYWORDS.test(p.title)).slice(0, MAX_PHOTOS);
 }
 
 function setPhotosStatus(message, isError = false) {
